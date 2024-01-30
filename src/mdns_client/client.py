@@ -4,7 +4,7 @@ import time
 from collections import namedtuple
 from select import select
 
-import uasyncio
+import asyncio
 
 from mdns_client.constants import CLASS_IN, LOCAL_MDNS_SUFFIX, MAX_PACKET_SIZE, MDNS_ADDR, MDNS_PORT, TYPE_A
 from mdns_client.parser import parse_packet
@@ -56,29 +56,39 @@ class Client:
         self.callbacks[callback_config.id] = callback_config
         if self.stopped:
             self.dprint("Added consumer on stopped mdns client. Starting it now.")
-            self.stopped = False
-            loop = uasyncio.get_event_loop()
+            loop = asyncio.get_event_loop()
             loop.create_task(self.start())
         return callback_config
 
     def _make_socket(self) -> socket.socket:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        member_info = dotted_ip_to_bytes(MDNS_ADDR) + dotted_ip_to_bytes(self.local_addr)
-        sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, member_info)
-        sock.setblocking(False)
-        return sock
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            member_info = dotted_ip_to_bytes(MDNS_ADDR) + dotted_ip_to_bytes(self.local_addr)
+            sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, member_info)
+            sock.setblocking(False)
+            return sock
+        except OSError as e:
+            if e.errno == 98:    # EADDRINUSE
+                self.dprint("Address already in use")
+            elif e.errno == 6: # ENXIO
+                self.dprint("Network is down")
+            else:
+                raise e
+            return None
 
     async def start(self) -> None:
-        self.stopped = False
         self._init_socket()
-        await self.consume()
+        if self.socket is not None:
+            self.stopped = False
+            await self.consume()
 
     def _init_socket(self) -> None:
         if self.socket is not None:
             self.socket.close()
         self.socket = self._make_socket()
-        self.socket.bind(("", MDNS_PORT))
+        if self.socket is not None:
+            self.socket.bind(("", MDNS_PORT))
 
     def stop(self) -> None:
         self.stopped = True
@@ -92,7 +102,7 @@ class Client:
     async def consume(self) -> None:
         while not self.stopped:
             await self.process_waiting_data()
-            await uasyncio.sleep_ms(100)
+            await asyncio.sleep_ms(100)
 
     async def process_waiting_data(self) -> None:
         while not self.stopped:
@@ -127,7 +137,7 @@ class Client:
             if self.print_packets:
                 print(parsed_packet)
         else:
-            loop = uasyncio.get_event_loop()
+            loop = asyncio.get_event_loop()
             for callback in self.callbacks.values():
                 loop.create_task(callback.callback(parsed_packet))
                 if callback.timedout:
@@ -214,7 +224,7 @@ class Client:
                 if record.record_type == expected_type and record.name == name:
                     return record
 
-        result = {"data": None, "event": uasyncio.Event()}
+        result = {"data": None, "event": asyncio.Event()}
 
         async def scan_response(dns_response: DNSResponse) -> None:
             record = matching_record(dns_response)
@@ -223,7 +233,7 @@ class Client:
             result["data"] = record
             result["event"].set()
 
-        loop = uasyncio.get_event_loop()
+        loop = asyncio.get_event_loop()
         loop.create_task(set_after_timeout(result["event"], timeout))
 
         async def is_match(dns_response: DNSResponse) -> bool:
